@@ -28,13 +28,14 @@ Where:
 
 The "zero line" occurs around a TP:FP ratio of 1:90, but can be tuned via the w/k parameters.
 
-## Query Implementation
+## Query Implementation - (With help from [MlgHodorMech](https://www.reddit.com/user/MlgHodorMech/))
 
 ```humio
 (#event_simpleName="Event_UserActivityAuditEvent" OperationName="detection_update" Attributes.resolution=/(true|false)_positive/i) OR (#event_simpleName=/DetectionSummaryEvent/)
 | CompoId:=coalesce(Attributes.composite_id, CompositeId)
+| RuleName:=coalesce(DetectName, IOARuleName, Name) // Added in RuleName here since I wanted that in mine, plus can replace a few of items in the first groupBy()
 | selfJoinFilter([CompoId], where=[{#event_simpleName="Event_UserActivityAuditEvent" OperationName="detection_update" Attributes.resolution=/(true|false)_positive/i}, {#event_simpleName=/DetectionSummaryEvent/}], prefilter=true)
-| groupBy([CompoId], function=([collect([Attributes.resolution, UserId, UserIp, EventUUID, DetectName, ComputerName, IOARuleName, Name]), count(#event_simpleName, distinct=true, as=eventCount)]))
+| groupBy([CompoId], function=([collect([Attributes.resolution, UserId, UserIp, EventUUID, ComputerName, RuleName]), count(#event_simpleName, distinct=true, as=eventCount)])) // Updated groupBy for the RuleName
 | case {
     Attributes.resolution="true_positive" | TP:=1 | FP:=0;
     Attributes.resolution="false_positive" | TP:=0 | FP:=1;
@@ -42,9 +43,47 @@ The "zero line" occurs around a TP:FP ratio of 1:90, but can be tuned via the w/
   }
 | TP:=coalesce(TP, 0) 
 | FP:=coalesce(FP, 0)
-| w:=2.0 | k:=0.5
-| DRAPE:=(w * TP * (TP/(TP+FP+1))) - (k * FP)
+
+
+| groupBy([RuleName], function=[sum(FP, as=FP), sum(TP, as=TP)]) // Further groupBy to pivot on the RuleName. The initial query had sum(TP), sum(FP), but this errored as the default field the sum function creates is _sum, and it was creating it for both. Adding in the names makes it work without the error. 
+
+
+| w:=1.5 | k:=0.3 // my values for testing
+| Total := FP+TP // create a total field - this allowed me to calculate percentage rates and make the score calculation a bit easier / cleaner
+
+
+// Logarythmic calculations
+
+
+// Relevant Python chunk:
+// tlog = math.log10(tp+1.0)
+// flog = math.log10(fp+1.0)
+
+
+// Logscale calculations seem only to be able to be done on fields, not a value of a calculation. 
+| tlog := TP + 1.0
+| flog := FP + 1.0
+| tlog := math:log10(tlog)
+| flog := math:log10(flog)
+
+
+// Score calculation
+
+
+// Relevant Python chunk:
+// score = (tlog * (1.0 + w * precision)) - ((k *  flog) / (tlog + 1.0))
+
+
+| DRAPE := (tlog * (1.0 + w * (TP / Total))) - ((k * flog) / (tlog + 1.0))
 | sort(DRAPE, order=desc)
+
+
+// Rounding / formatting
+// Relevant Python chunk:
+// return round(score * 10.0,2)
+| DRAPE := DRAPE * 10.0
+| DRAPE := format("%.2f", field=DRAPE) // Round to two decimal places
+| select([RuleName, FP, TP, Total, DRAPE]) // select just the values we want in the display
 ```
 
 ## How It Works
